@@ -28,6 +28,8 @@ fn recv(mut rx: Box<dyn DataLinkReceiver>, tx: Sender<Arp>) {
     }
 }
 
+/// Takes an interface  as a String and a Sender and sends all arps down the tx pipe.
+/// On connection/receive issues fn throws an error.
 pub fn recv_arp(interface: String, tx: Sender<Arp>) -> io::Result<()> {
     let interfaces = datalink::interfaces();
     let interfaces_name_match = |iface: &NetworkInterface| iface.name == interface;
