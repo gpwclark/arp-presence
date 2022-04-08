@@ -1,10 +1,9 @@
 use arp_presence::arp_listener::recv_arp;
 use clap::Parser;
-use log::LevelFilter;
 use log::{error, info};
-use std::sync::mpsc;
-use std::sync::mpsc::TryRecvError;
 use std::thread;
+use tokio::sync::broadcast;
+use tokio::sync::broadcast::error::TryRecvError;
 
 /// Simple program to listen for ARP ethernet frames
 #[derive(Parser, Debug)]
@@ -16,13 +15,11 @@ struct Args {
 }
 
 fn main() {
-    simple_logging::log_to_stderr(LevelFilter::Info);
+    pretty_env_logger::init();
 
     let args = Args::parse();
-    let (tx, rx) = mpsc::channel();
+    let (tx, mut rx) = broadcast::channel(256);
     thread::spawn(|| {
-        // unwrap is wrong, if something blows up, e.g. wrong interface, need a way to terminate loop
-        // in main
         if let Err(e) = recv_arp(args.interface, tx) {
             error!("{}", e);
         }
@@ -32,11 +29,8 @@ fn main() {
             Ok(res) => {
                 info!("Received Arp from MacAddr: {:?}", res.sender_hw_addr);
             }
-            Err(TryRecvError::Disconnected) => {
-                info!(
-                    "Terminating arp printing thread! {}",
-                    TryRecvError::Disconnected
-                );
+            Err(TryRecvError::Closed) => {
+                info!("Terminating arp printing thread! {}", TryRecvError::Closed);
                 break;
             }
             _ => {}

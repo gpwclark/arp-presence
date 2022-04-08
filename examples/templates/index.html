@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>Arp Presence</title>
+    <script src="https://unpkg.com/htmx.org@1.7.0" integrity="sha384-EzBXYPt0/T6gxNp0nuPtLkmRpmDBbjg6WmCUZRLXBBwYYmwAUxzlSGej0ARHX0Bo" crossorigin="anonymous"></script>
+    <script src="https://code.jquery.com/jquery-3.6.0.slim.min.js" integrity="sha256-u7e5khyithlIdTpu22PHhENmPcRdFiHRjhAuHcs05RI=" crossorigin="anonymous"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/moment.js/2.29.1/moment.min.js" integrity="sha512-qTXRIMyZIFb8iQcfjXWCO8+M5Tbc38Qi5WzdPOYZHIlZpzBHG3L3by84BBBOiRGiEb7KKtAOAs5qYdUiZiQNNQ==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+    <style>
+        .right {
+            text-align: right;
+            margin-right: 1em;
+        }
+
+        .left {
+            text-align: left;
+            margin-left: 1em;
+        }
+    </style>
+</head>
+<body>
+<h1>Arp Presence</h1>
+<div id="status">
+    <p><em>Connecting...</em></p>
+</div>
+<div hx-ws="connect:/arps">
+    <div id="arps">
+    </div>
+</div>
+<script type="text/javascript">
+    var runUpdate = function() {
+        var startDate = Date.now();
+        $(".raw_time_ms").each(function(index) {
+            var text = $(this).data("time");
+            var num = Number(text);
+            var targetDate = new Date(0);
+            targetDate.setUTCMilliseconds(num);
+            var timeDiff = startDate - targetDate;
+            var duration = moment.duration(timeDiff);
+            $(this).text(duration.humanize());
+        });
+    };
+    $( document ).ready(function() {
+        console.log( "ready!" );
+        runUpdate();
+    });
+    const status = document.getElementById('status');
+    const uri = 'ws://' + location.host + '/arps';
+    console.log(`URI ${uri}`);
+    const ws = new WebSocket(uri);
+
+    var interval = setInterval(() => {
+        runUpdate();
+    }, 1000);
+
+    ws.onopen = function() {
+        status.innerHTML = '<p><em>Connected!</em></p>';
+    };
+
+    ws.onclose = function() {
+        status.innerHTML = '<p><em>Disconnected!</em></p>';
+        clearInterval(interval);
+    };
+
+</script>
+</body>
+</html>
