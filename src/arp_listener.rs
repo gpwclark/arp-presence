@@ -5,16 +5,15 @@ use pnet::packet::ethernet::{EtherTypes, EthernetPacket};
 use pnet::packet::{FromPacket, Packet};
 use std::io;
 use std::io::{Error, ErrorKind};
-use tokio::sync::broadcast::Sender;
+use tokio::sync::mpsc::UnboundedSender;
 
-fn recv(mut rx: Box<dyn DataLinkReceiver>, tx: Sender<Arp>) {
+fn recv(mut rx: Box<dyn DataLinkReceiver>, tx: UnboundedSender<Arp>) {
     loop {
         if let Ok(frame) = rx.next() {
             if let Some(pkt) = EthernetPacket::new(frame) {
                 if pkt.get_ethertype() == EtherTypes::Arp {
                     if let Some(arp) = ArpPacket::new(pkt.payload()) {
                         let arp_packet = arp.from_packet();
-                        debug!("Arp packet from sender: {}.", arp_packet.sender_hw_addr);
                         match tx.send(arp_packet) {
                             Ok(_) => {}
                             Err(e) => {
@@ -31,7 +30,7 @@ fn recv(mut rx: Box<dyn DataLinkReceiver>, tx: Sender<Arp>) {
 
 /// Takes an interface as a String and a Sender and sends all arps down the tx pipe.
 /// On connection/receive issues fn throws an error.
-pub fn recv_arp(interface: String, tx: Sender<Arp>) -> io::Result<()> {
+pub fn recv_arp(interface: String, tx: UnboundedSender<Arp>) -> io::Result<()> {
     let interfaces = datalink::interfaces();
     let interfaces_name_match = |iface: &NetworkInterface| iface.name == interface;
     if let Some(interface) = interfaces.into_iter().find(interfaces_name_match) {

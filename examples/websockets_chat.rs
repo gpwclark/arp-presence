@@ -2,23 +2,26 @@ use arp_presence::arp_listener::recv_arp;
 use clap::lazy_static::lazy_static;
 use clap::Parser;
 use futures_util::{SinkExt, StreamExt, TryFutureExt};
-use log::{error, warn};
+use log::{debug, error, warn};
 use pnet::packet::arp::Arp;
 use pnet::util::MacAddr;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tera::{Context, Tera};
-use tokio::sync::broadcast;
-use tokio::sync::broadcast::error::{RecvError, TryRecvError};
+use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::broadcast::Receiver;
+use tokio::sync::{broadcast, mpsc, RwLock};
 use warp::ws::{Message, WebSocket};
 use warp::Filter;
 
 static INDEX_HTML_FILE: &str = "index.html";
 static PARTIAL_HTML_FILE: &str = "partial.html";
+
+type ConnectedClients = Arc<RwLock<HashMap<MacAddr, LastHeardFrom>>>;
 
 lazy_static! {
     pub static ref TEMPLATES: Tera = {
@@ -29,8 +32,7 @@ lazy_static! {
                 ::std::process::exit(1);
             }
         };
-        tera.autoescape_on(vec![".html", ".sql"]);
-        //tera.register_filter("do_nothing", do_nothing_filter);
+        tera.autoescape_on(vec![".html"]);
         tera
     };
 }
@@ -55,20 +57,48 @@ async fn main() {
 
     let args = Args::parse();
 
-    let (tx, _) = broadcast::channel(256);
-    let tx2 = tx.clone();
+    let (tx, mut rx) = mpsc::unbounded_channel();
     thread::spawn(|| {
-        if let Err(e) = recv_arp(args.interface, tx2) {
+        if let Err(e) = recv_arp(args.interface, tx) {
             error!("{}", e);
         }
     });
 
+    let connected_clients = ConnectedClients::default();
+    let connected_clients2 = connected_clients.clone();
+    let (broadcast_tx, broadcast_rx) = broadcast::channel(1);
+    let mut broadcast_tx2 = broadcast_tx.clone();
+    tokio::task::spawn(async move {
+        loop {
+            match rx.recv().await {
+                Some(res) => {
+                    let mac_addr = res.sender_hw_addr;
+                    debug!("Arp packet from sender: {}.", mac_addr);
+                    connected_clients2
+                        .write()
+                        .await
+                        .entry(mac_addr)
+                        .or_insert_with(|| LastHeardFrom::new(mac_addr.to_string()))
+                        .update();
+                    broadcast_tx2.send(res);
+                }
+                None => {
+                    warn!("Terminating arp printing thread!");
+                    break;
+                }
+            }
+        }
+    });
+
+    let connected_clients = warp::any().map(move || connected_clients.clone());
+
     let arps = warp::path("arps")
         .and(warp::ws())
-        .map(move |ws: warp::ws::Ws| {
+        .and(connected_clients)
+        .map(move |ws: warp::ws::Ws, connected_clients| {
             // This will call our function if the handshake succeeds.
-            let rx = tx.subscribe();
-            ws.on_upgrade(move |socket| new_connection(socket, rx))
+            let rx = broadcast_tx.subscribe();
+            ws.on_upgrade(move |socket| new_connection(socket, rx, connected_clients))
         });
 
     let tmpl = TEMPLATES
@@ -137,25 +167,24 @@ impl LastHeardFrom {
     }
 }
 
-async fn new_connection(ws: WebSocket, mut receiver: Receiver<Arp>) {
+async fn new_connection(
+    ws: WebSocket,
+    mut receiver: Receiver<Arp>,
+    connected_clients: ConnectedClients,
+) {
     let curr_id = NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
 
+    debug!("spawn cid={}", curr_id);
     let (mut ws_tx, mut ws_rx) = ws.split();
 
     tokio::task::spawn(async move {
-        let mut map: HashMap<MacAddr, LastHeardFrom> = HashMap::new();
         let mut tx_broken = false;
         loop {
             match receiver.recv().await {
-                Ok(res) => {
-                    let mac_addr = res.sender_hw_addr;
-
-                    map.entry(mac_addr)
-                        .or_insert_with(|| LastHeardFrom::new(mac_addr.to_string()))
-                        .update();
-
+                Ok(_) => {
                     let mut context = Context::new();
-                    let mut entries = map.values().collect::<Vec<&LastHeardFrom>>();
+                    let entries = connected_clients.read().await;
+                    let mut entries = entries.values().collect::<Vec<&LastHeardFrom>>();
                     entries.sort();
                     context.insert("entries", &entries);
                     let tmpl = TEMPLATES
@@ -170,7 +199,7 @@ async fn new_connection(ws: WebSocket, mut receiver: Receiver<Arp>) {
                         .await;
                 }
                 Err(RecvError::Closed) => {
-                    warn!("Terminating arp printing thread! {}", TryRecvError::Closed);
+                    warn!("Terminating arp printing thread! {}", RecvError::Closed);
                     break;
                 }
                 _ => {}
