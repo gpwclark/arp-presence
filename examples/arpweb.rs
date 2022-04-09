@@ -2,25 +2,24 @@ use arp_presence::arp_listener::recv_arp;
 use clap::lazy_static::lazy_static;
 use clap::Parser;
 use futures_util::{SinkExt, StreamExt, TryFutureExt};
-use log::{debug, error, warn};
+use log::{debug, error, info, warn};
 use pnet::util::MacAddr;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tera::{Context, Tera};
-use tokio::sync::broadcast::error::RecvError;
-use tokio::sync::broadcast::Receiver;
-use tokio::sync::{broadcast, mpsc, RwLock};
+use tokio::sync::{mpsc, RwLock};
+use tokio::task;
+use tokio::time;
 use warp::ws::{Message, WebSocket};
 use warp::Filter;
 
 static INDEX_HTML_FILE: &str = "index.html";
 static PARTIAL_HTML_FILE: &str = "partial.html";
 
-type ConnectedClients = Arc<RwLock<HashMap<MacAddr, LastHeardFrom>>>;
+type KnownMacAddrs = Arc<RwLock<HashMap<MacAddr, LastHeardFrom>>>;
 
 lazy_static! {
     pub static ref TEMPLATES: Tera = {
@@ -42,15 +41,21 @@ static NEXT_CONNECTION_ID: AtomicUsize = AtomicUsize::new(1);
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
 struct Args {
-    /// Name of the person to greet
+    /// Name of interface to listen for ARPs on
     #[clap(short, long)]
     interface: String,
 
+    /// port to host web server
     #[clap(short, long)]
     port: u16,
 
+    /// ms timer to use for red/green row coloring
     #[clap(short, long)]
     threshold_ms: u64,
+
+    /// how frequently to send clients current ARPs
+    #[clap(short, long)]
+    update_freq_ms: u64,
 }
 
 #[tokio::main]
@@ -58,51 +63,20 @@ async fn main() {
     pretty_env_logger::init();
 
     let args = Args::parse();
+    let known_mac_addrs = KnownMacAddrs::default();
 
-    let (tx, mut rx) = mpsc::unbounded_channel();
-    thread::spawn(|| {
-        if let Err(e) = recv_arp(args.interface, tx) {
-            error!("{}", e);
-        }
-    });
+    update_mac_addrs_task(known_mac_addrs.clone(), args.threshold_ms, args.interface);
+    info!("Clients will be notified every {} ms", args.update_freq_ms);
 
-    let connected_clients = ConnectedClients::default();
-    let connected_clients2 = connected_clients.clone();
-    let (broadcast_tx, _) = broadcast::channel(1);
-    let broadcast_tx2 = broadcast_tx.clone();
-    let threshold = args.threshold_ms;
-    tokio::task::spawn(async move {
-        loop {
-            match rx.recv().await {
-                Some(res) => {
-                    let mac_addr = res.sender_hw_addr;
-                    debug!("Arp packet from sender: {}.", mac_addr);
-                    connected_clients2
-                        .write()
-                        .await
-                        .entry(mac_addr)
-                        .or_insert_with(|| LastHeardFrom::new(mac_addr.to_string()))
-                        .update(threshold);
-                    if broadcast_tx2.send(SystemTime::now()).is_ok() {}
-                }
-                None => {
-                    warn!("Terminating arp printing thread!");
-                    break;
-                }
-            }
-        }
-    });
+    let known_mac_addrs = warp::any().map(move || known_mac_addrs.clone());
 
-    let connected_clients = warp::any().map(move || connected_clients.clone());
-
-    let arps = warp::path("arps")
-        .and(warp::ws())
-        .and(connected_clients)
-        .map(move |ws: warp::ws::Ws, connected_clients| {
-            // This will call our function if the handshake succeeds.
-            let rx = broadcast_tx.subscribe();
-            ws.on_upgrade(move |socket| new_connection(socket, rx, connected_clients))
-        });
+    let arps = warp::path("arps").and(warp::ws()).and(known_mac_addrs).map(
+        move |ws: warp::ws::Ws, known_mac_addrs| {
+            ws.on_upgrade(move |socket| {
+                new_connection(socket, args.update_freq_ms, known_mac_addrs)
+            })
+        },
+    );
 
     let mut context = Context::new();
     context.insert("threshold_ms", &args.threshold_ms);
@@ -116,6 +90,39 @@ async fn main() {
     let routes = index.or(arps);
 
     warp::serve(routes).run(([0, 0, 0, 0], args.port)).await;
+}
+
+fn update_mac_addrs_task(
+    known_mac_addrs: Arc<RwLock<HashMap<MacAddr, LastHeardFrom>>>,
+    threshold: u64,
+    interface: String,
+) {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    task::spawn_blocking(|| {
+        if let Err(e) = recv_arp(interface, tx) {
+            error!("{}", e);
+        }
+    });
+    tokio::task::spawn(async move {
+        loop {
+            match rx.recv().await {
+                Some(res) => {
+                    let mac_addr = res.sender_hw_addr;
+                    debug!("Arp packet from sender: {}.", mac_addr);
+                    known_mac_addrs
+                        .write()
+                        .await
+                        .entry(mac_addr)
+                        .or_insert_with(|| LastHeardFrom::new(mac_addr.to_string()))
+                        .update(threshold);
+                }
+                None => {
+                    warn!("Terminating arp printing thread!");
+                    break;
+                }
+            }
+        }
+    });
 }
 
 #[derive(Serialize)]
@@ -191,45 +198,33 @@ impl LastHeardFrom {
     }
 }
 
-async fn new_connection(
-    ws: WebSocket,
-    mut receiver: Receiver<SystemTime>,
-    connected_clients: ConnectedClients,
-) {
+async fn new_connection(ws: WebSocket, update_freq: u64, connected_clients: KnownMacAddrs) {
+    let mut interval = time::interval(Duration::from_millis(update_freq));
     let curr_id = NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
 
-    debug!("spawn cid={}", curr_id);
+    debug!("spawn socket#={}", curr_id);
     let (mut ws_tx, mut ws_rx) = ws.split();
 
     tokio::task::spawn(async move {
         let mut tx_broken = false;
-
         loop {
-            match receiver.recv().await {
-                Ok(_) => {
-                    let mut context = Context::new();
-                    let entries = connected_clients.read().await;
-                    let mut entries = entries.values().collect::<Vec<&LastHeardFrom>>();
-                    entries.sort();
-                    entries.reverse();
-                    context.insert("entries", &entries);
-                    let tmpl = TEMPLATES
-                        .render(PARTIAL_HTML_FILE, &context)
-                        .unwrap_or_default();
-                    ws_tx
-                        .send(Message::text(tmpl))
-                        .unwrap_or_else(|e| {
-                            error!("Failed to send message, closing socket {}: {}", curr_id, e);
-                            tx_broken = true;
-                        })
-                        .await;
-                }
-                Err(RecvError::Closed) => {
-                    warn!("Terminating arp printing thread! {}", RecvError::Closed);
-                    break;
-                }
-                _ => {}
-            }
+            interval.tick().await;
+            let mut context = Context::new();
+            let entries = connected_clients.read().await;
+            let mut entries = entries.values().collect::<Vec<&LastHeardFrom>>();
+            entries.sort();
+            entries.reverse();
+            context.insert("entries", &entries);
+            let tmpl = TEMPLATES
+                .render(PARTIAL_HTML_FILE, &context)
+                .unwrap_or_default();
+            ws_tx
+                .send(Message::text(tmpl))
+                .unwrap_or_else(|e| {
+                    error!("Failed to send message, closing socket# {}: {}", curr_id, e);
+                    tx_broken = true;
+                })
+                .await;
             if tx_broken {
                 break;
             }
@@ -240,7 +235,7 @@ async fn new_connection(
         match result {
             Ok(_) => {}
             Err(e) => {
-                error!("websocket error(cid={}): {}", curr_id, e);
+                error!("websocket error(socket#={}): {}", curr_id, e);
                 break;
             }
         };
