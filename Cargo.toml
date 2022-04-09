@@ -10,10 +10,11 @@ log = "0.4.14"
 libc = "0.2.120"
 pnet = {version = "0.29.0", features = ["pcap"]}
 clap = {version = "3.1.6", features = ["derive"]}
-tokio = { version = "1", features = ["full", "sync"] }
-tokio-stream = { version = "0.1", features = ["net"]}
+tokio = { version = "1", features = ["sync"] }
 
 [dev-dependencies]
+tokio-stream = { version = "0.1", features = ["net"]}
+tokio = { version = "1", features = ["full"] }
 pretty_env_logger = "0.4"
 warp = "0.3"
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }

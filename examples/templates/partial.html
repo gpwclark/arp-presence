@@ -4,12 +4,14 @@
         <th class="left">MAC Address</th>
         <th class="left">count</th>
         <th class="left">duration since last heard</th>
+        <th class="left">duration since last threshold gap reached</th>
     </tr>
     {% for entry in entries %}
-    <tr>
+    <tr class="data_row">
         <td class="right">{{ entry.addr }}</td>
         <td class="right">{{ entry.count }}</td>
         <td class="right raw_time_ms" data-time="{{ entry.duration_since }}"></td>
+        <td class="right threshold_ms" data-threshold="{{ entry.threshold }}"></td>
     </tr>
     {% endfor %}
 </table>

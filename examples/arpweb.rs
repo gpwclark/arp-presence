@@ -3,7 +3,6 @@ use clap::lazy_static::lazy_static;
 use clap::Parser;
 use futures_util::{SinkExt, StreamExt, TryFutureExt};
 use log::{debug, error, warn};
-use pnet::packet::arp::Arp;
 use pnet::util::MacAddr;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -49,6 +48,9 @@ struct Args {
 
     #[clap(short, long)]
     port: u16,
+
+    #[clap(short, long)]
+    threshold_ms: u64,
 }
 
 #[tokio::main]
@@ -66,8 +68,9 @@ async fn main() {
 
     let connected_clients = ConnectedClients::default();
     let connected_clients2 = connected_clients.clone();
-    let (broadcast_tx, broadcast_rx) = broadcast::channel(1);
-    let mut broadcast_tx2 = broadcast_tx.clone();
+    let (broadcast_tx, _) = broadcast::channel(1);
+    let broadcast_tx2 = broadcast_tx.clone();
+    let threshold = args.threshold_ms;
     tokio::task::spawn(async move {
         loop {
             match rx.recv().await {
@@ -79,8 +82,8 @@ async fn main() {
                         .await
                         .entry(mac_addr)
                         .or_insert_with(|| LastHeardFrom::new(mac_addr.to_string()))
-                        .update();
-                    broadcast_tx2.send(res);
+                        .update(threshold);
+                    if broadcast_tx2.send(SystemTime::now()).is_ok() {}
                 }
                 None => {
                     warn!("Terminating arp printing thread!");
@@ -101,8 +104,10 @@ async fn main() {
             ws.on_upgrade(move |socket| new_connection(socket, rx, connected_clients))
         });
 
+    let mut context = Context::new();
+    context.insert("threshold_ms", &args.threshold_ms);
     let tmpl = TEMPLATES
-        .render(INDEX_HTML_FILE, &Context::new())
+        .render(INDEX_HTML_FILE, &context)
         .unwrap_or_default();
 
     // hit root, return index.html
@@ -110,7 +115,7 @@ async fn main() {
 
     let routes = index.or(arps);
 
-    warp::serve(routes).run(([127, 0, 0, 1], args.port)).await;
+    warp::serve(routes).run(([0, 0, 0, 0], args.port)).await;
 }
 
 #[derive(Serialize)]
@@ -119,6 +124,7 @@ struct LastHeardFrom {
     pub count: u32,
     pub duration_since: u64,
     pub last_heard_from: SystemTime,
+    pub threshold: u64,
 }
 
 impl PartialEq for LastHeardFrom {
@@ -145,6 +151,10 @@ impl LastHeardFrom {
     pub fn new(addr: String) -> Self {
         let count = 1;
         let last_heard_from = SystemTime::now();
+        let threshold = last_heard_from
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
         let duration_since = last_heard_from
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -154,22 +164,36 @@ impl LastHeardFrom {
             count,
             last_heard_from,
             duration_since,
+            threshold,
         }
     }
-    fn update(&mut self) {
+
+    fn update(&mut self, threshold: u64) {
         let now = SystemTime::now();
-        self.count = self.count + 1;
+        self.count += 1;
         self.duration_since = now
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
+        let last_heard_epoch = self
+            .last_heard_from
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let diff = self.duration_since - last_heard_epoch;
+        if diff >= threshold {
+            self.threshold = now
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+        }
         self.last_heard_from = now;
     }
 }
 
 async fn new_connection(
     ws: WebSocket,
-    mut receiver: Receiver<Arp>,
+    mut receiver: Receiver<SystemTime>,
     connected_clients: ConnectedClients,
 ) {
     let curr_id = NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
@@ -179,6 +203,7 @@ async fn new_connection(
 
     tokio::task::spawn(async move {
         let mut tx_broken = false;
+
         loop {
             match receiver.recv().await {
                 Ok(_) => {
@@ -186,6 +211,7 @@ async fn new_connection(
                     let entries = connected_clients.read().await;
                     let mut entries = entries.values().collect::<Vec<&LastHeardFrom>>();
                     entries.sort();
+                    entries.reverse();
                     context.insert("entries", &entries);
                     let tmpl = TEMPLATES
                         .render(PARTIAL_HTML_FILE, &context)

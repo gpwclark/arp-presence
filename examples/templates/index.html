@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-threshold="{{ threshold_ms }}">
 <head>
     <meta charset="utf-8">
     <title>Arp Presence</title>
@@ -16,34 +16,110 @@
             text-align: left;
             margin-left: 1em;
         }
+
+        table{
+            margin: 30px;
+            border-collapse: collapse;
+        }
+
+        table tr {
+            border: 1px solid #666;
+            padding-left: 2em;
+            padding-right: 2em;
+        }
+
+        table tr td {
+            border: 1px solid #666;
+            padding-left: 2em;
+            padding-right: 2em;
+        }
+
+        table tr th {
+            border: 1px solid #666;
+            padding-left: 2em;
+            padding-right: 2em;
+        }
+
+        #arps {
+            display: none;
+        }
     </style>
 </head>
 <body>
 <h1>Arp Presence</h1>
+<h3>Threshold: <span data-threshold="{{ threshold_ms }}" id="data_threshold"></span></h3>
+<div>
+    <p>Row is green when a MAC address that has not been seen for threshold comes back on the network. Row persists green for threshold.</p>
+    <p>Row is red when a MAC address has not been heard for threshold.</p>
+</div>
 <div id="status">
     <p><em>Connecting...</em></p>
 </div>
+<div id="displayed_arp_table">
+</div>
 <div hx-ws="connect:/arps">
-    <div id="arps">
-    </div>
+    <div id="arps"></div>
 </div>
 <script type="text/javascript">
+    function toDate(text) {
+        var num = Number(text);
+        var targetDate = new Date(0);
+        targetDate.setUTCMilliseconds(num);
+        return targetDate;
+    }
+
+    function handleTimeDiff(elem, timeDiff) {
+        if (timeDiff < 60000) {
+            var seconds = parseInt(timeDiff / 1000);
+            if (seconds === 1) {
+                elem.text(`${seconds} second `);
+            } else {
+                elem.text(`${seconds} seconds`);
+            }
+        } else {
+            var duration = moment.duration(timeDiff);
+            elem.text(duration.humanize());
+        }
+    }
+
     var runUpdate = function() {
+        $("#data_threshold").each(function(index) {
+            var text = $(this).data("threshold");
+            var date = toDate(text);
+            handleTimeDiff($(this), date);
+        });
         var startDate = Date.now();
         $(".raw_time_ms").each(function(index) {
             var text = $(this).data("time");
-            var num = Number(text);
-            var targetDate = new Date(0);
-            targetDate.setUTCMilliseconds(num);
+            var targetDate = toDate(text);
             var timeDiff = startDate - targetDate;
-            var duration = moment.duration(timeDiff);
-            $(this).text(duration.humanize());
+            handleTimeDiff($(this), timeDiff);
+            let elem = document.documentElement.dataset["threshold"];
+            let thresholdNum = Number(elem);
+            if (timeDiff > thresholdNum) {
+                $(this).parent().css("background-color", "red");
+            }
         });
+        $(".threshold_ms").each(function(index) {
+            var threshold = $(this).data("threshold");
+            var thresholdDate = toDate(threshold);
+            var thresholdDiff = startDate - thresholdDate;
+            $(this).text(thresholdDiff);
+            let elem = document.documentElement.dataset["threshold"];
+            let thresholdNum = Number(elem);
+            if (thresholdDiff < thresholdNum) {
+                $(this).parent().css("background-color", "green");
+            }
+            handleTimeDiff($(this), thresholdDiff);
+        });
+        $("#displayed_arp_table").html($("#arps").html());
     };
+
     $( document ).ready(function() {
         console.log( "ready!" );
         runUpdate();
     });
+
     const status = document.getElementById('status');
     const uri = 'ws://' + location.host + '/arps';
     console.log(`URI ${uri}`);
@@ -61,7 +137,6 @@
         status.innerHTML = '<p><em>Disconnected!</em></p>';
         clearInterval(interval);
     };
-
 </script>
 </body>
 </html>

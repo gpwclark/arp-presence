@@ -1,4 +1,4 @@
-use log::{debug, info};
+use log::info;
 use pnet::datalink::{self, Channel, DataLinkReceiver, NetworkInterface};
 use pnet::packet::arp::{Arp, ArpPacket};
 use pnet::packet::ethernet::{EtherTypes, EthernetPacket};
